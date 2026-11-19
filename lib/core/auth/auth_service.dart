@@ -1,0 +1,660 @@
+import 'dart:convert';
+import 'dart:math' as math;
+import 'package:crypto/crypto.dart';
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:sign_in_with_apple/sign_in_with_apple.dart';
+import '../network/api_client.dart';
+import '../storage/storage_service.dart';
+import '../../shared/models/student_model.dart';
+
+class AuthResult {
+  final bool success;
+  final StudentModel? student;
+  final String? token;
+  final String? errorMessage;
+  final bool isAgeDenied;
+  final bool isNewUser;
+  final bool profileCompleted;
+  final bool requiresParentalConsent;
+
+  const AuthResult({
+    
+    required this.success,
+    this.student,
+    this.token,
+    this.errorMessage,
+    this.isAgeDenied = false,
+    this.isNewUser = false,
+    this.profileCompleted = true,
+    this.requiresParentalConsent = false,
+  });
+}
+
+class AuthService {
+  static final AuthService _instance = AuthService._internal();
+  factory AuthService() => _instance;
+  AuthService._internal();
+
+  GoogleSignIn? _googleSignInInstance;
+  bool _googleSignInInitFailed = false;
+
+  /// Web OAuth Client ID from Google Cloud Console
+  /// Authorized JavaScript origins: http://localhost:8085
+
+    
+  
+  static String webClientId = const String.fromEnvironment(
+    'GOOGLE_CLIENT_ID',
+    defaultValue:
+        '608766203356-d6oq3gvc5n199671ho1npgr240afkjup.apps.googleusercontent.com',
+  );
+
+  /// iOS OAuth Client ID from Google Cloud Console
+  static String iosClientId = const String.fromEnvironment(
+    'GOOGLE_IOS_CLIENT_ID',
+    defaultValue:
+        '608766203356-d6oq3gvc5n199671ho1npgr240afkjup.apps.googleusercontent.com',
+  );
+
+  /// Allows setting web client id at runtime if needed
+  static void setWebClientId(String clientId) {
+    webClientId = clientId;
+  }
+
+  /// Allows setting iOS client id at runtime if needed
+  static void setIosClientId(String clientId) {
+    iosClientId = clientId;
+  }
+
+  /// Controlled lazy initialization for GoogleSignIn
+  GoogleSignIn? _getGoogleSignIn() {
+    if (_googleSignInInitFailed) return null;
+    if (_googleSignInInstance != null) return _googleSignInInstance;
+
+    try {
+      _googleSignInInstance = GoogleSignIn(
+        clientId: kIsWeb ? webClientId : iosClientId,
+        serverClientId: kIsWeb ? null : webClientId,
+        scopes: const ['email', 'profile'],
+      );
+      return _googleSignInInstance;
+    } catch (e, stack) {
+      debugPrint('⚠️ GoogleSignIn initsializatsiya xatosi: $e\n$stack');
+      _googleSignInInitFailed = true;
+      return null;
+    }
+  }
+
+  /// Stream of Google user accounts (fired by GIS button or silent login)
+  
+  Stream<GoogleSignInAccount?> get onGoogleAccountChanged {
+    final gsi = _getGoogleSignIn();
+
+    
+    if (gsi == null) return const Stream.empty();
+    return gsi.onCurrentUserChanged;
+  }
+
+  /// Authenticate Google User with Backend
+  Future<AuthResult> authenticateGoogleUser(GoogleSignInAccount googleUser) async {
+    try {
+      final GoogleSignInAuthentication googleAuth = await googleUser.authentication;
+
+      final res = await ApiClient().dio.post('/auth/google', data: {
+        'googleId': googleUser.id,
+        'email': googleUser.email,
+        'displayName': googleUser.displayName ?? 'O‘quvchi',
+        'idToken': googleAuth.idToken,
+        'accessToken': googleAuth.accessToken,
+      });
+
+      if (res.data['success'] == true) {
+        final token = res.data['data']['token'] as String;
+        final bool isNewUser = res.data['data']['isNewUser'] == true;
+        final bool profileCompleted = res.data['data']['profileCompleted'] == true;
+        ApiClient().setAuthToken(token);
+        await StorageService.saveAuthToken(token);
+
+        final userData = res.data['data']['user'];
+        final student = StudentModel.fromJson(userData);
+        return AuthResult(
+          success: true,
+          student: student,
+          token: token,
+          isNewUser: isNewUser,
+          profileCompleted: profileCompleted,
+        );
+      } else {
+        return AuthResult(
+          success: false,
+          errorMessage: res.data['error'] ?? 'Google orqali kirishda xatolik yuz berdi.',
+        );
+      }
+    } catch (e) {
+      debugPrint('⚠️ Google orqali kirish backend xatoligi: $e');
+      return const AuthResult(
+        success: false,
+        errorMessage: 'Google orqali tizimga kirishda server bilan aloqa uzildi.',
+      );
+    }
+  }
+  
+  /// Check whether Google Sign-In is safely available
+
+  bool get isGoogleSignInAvailable => !_googleSignInInitFailed;
+
+  /// Sign In With Google with graceful fallback and no startup crash
+  Future<AuthResult> signInWithGoogle() async {
+    final googleSignIn = _getGoogleSignIn();
+    if (googleSignIn == null) {
+      return const AuthResult(
+        success: false,
+        errorMessage:
+            'Google orqali kirish sozlanmagan. Iltimos, to‘g‘ridan-to‘g‘ri hisob bilan kiring.',
+      );
+    }
+
+    try {
+      GoogleSignInAccount? googleUser;
+      // On web, try silent sign-in first to avoid unneeded popups
+      if (kIsWeb) {
+        try {
+          googleUser = await googleSignIn.signInSilently(suppressErrors: true);
+        } catch (_) {}
+      }
+
+      googleUser ??= await googleSignIn.signIn();
+
+      if (googleUser == null) {
+        // User dismissed the popup or cancelled
+        return const AuthResult(
+          success: false,
+          errorMessage: null,
+        );
+      }
+
+      return await authenticateGoogleUser(googleUser);
+    } catch (e) {
+      debugPrint('ℹ️ Google orqali kirish natijasi: $e');
+      final errStr = e.toString().toLowerCase();
+      if (errStr.contains('popup_closed') ||
+          errStr.contains('popup_blocked') ||
+          errStr.contains('cancel') ||
+          errStr.contains('canceled') ||
+          errStr.contains('closed') ||
+          errStr.contains('access_denied')) {
+        return const AuthResult(
+          success: false,
+          errorMessage: null, // Graceful cancellation, no intrusive error banner
+        );
+      }
+      if (errStr.contains('people.googleapis.com') ||
+          errStr.contains('people api') ||
+          errStr.contains('service_disabled')) {
+        return const AuthResult(
+          success: false,
+          errorMessage:
+              'Google Cloud Console loyihangizda "People API" yoqilmagan. Iltimos, Google konsolidan People API ni faollashtiring yoki to‘g‘ridan-to‘g‘ri login orqali kiring.',
+        );
+      }
+      if (errStr.contains('unregistered_origin') ||
+          errStr.contains('origin_mismatch') ||
+          errStr.contains('not allowed for the given client') ||
+          errStr.contains('403')) {
+        return const AuthResult(
+          success: false,
+          errorMessage:
+              'Ushbu veb-manzil (http://localhost:8085) Google Cloud Console da ruxsat etilmagan. Iltimos, konsoldan Authorized origins ga qo‘shing yoki login orqali kiring.',
+        );
+      }
+      return const AuthResult(
+        success: false,
+        errorMessage:
+            'Google tizimiga ulanib bo‘lmadi. Internet aloqasini tekshiring yoki ro‘yxatdan o‘tish orqali kiring.',
+      );
+    }
+  }
+
+  /// Login with Username/Email and Password
+  Future<AuthResult> login({
+    required String identifier,
+    required String password,
+  }) async {
+    try {
+      final res = await ApiClient().dio.post('/auth/login', data: {
+        'identifier': identifier.trim(),
+        'password': password,
+      });
+
+      if (res.data['success'] == true) {
+        final token = res.data['data']['token'] as String;
+        final bool isNewUser = res.data['data']['isNewUser'] == true;
+        final bool profileCompleted = res.data['data']['profileCompleted'] == true;
+        ApiClient().setAuthToken(token);
+        await StorageService.saveAuthToken(token);
+
+        final userData = res.data['data']['user'];
+        final student = StudentModel.fromJson(userData);
+        return AuthResult(
+          success: true,
+          student: student,
+          token: token,
+          isNewUser: isNewUser,
+          profileCompleted: profileCompleted,
+        );
+      } else {
+        return AuthResult(
+          success: false,
+          errorMessage: res.data['error'] ?? 'Login yoki parol noto‘g‘ri.',
+        );
+      }
+    } catch (e) {
+      if (e is DioException && e.response?.data != null && e.response?.data['error'] != null) {
+        return AuthResult(
+          success: false,
+          errorMessage: e.response!.data['error'].toString(),
+        );
+      }
+      return const AuthResult(
+        success: false,
+        errorMessage: 'Login yoki parol noto‘g‘ri yoki server bilan aloqa yo‘q.',
+      );
+    }
+  }
+
+  /// Legacy compatibility wrapper for loginWithEmailPassword
+  Future<AuthResult> loginWithEmailPassword({
+    required String email,
+    required String password,
+  }) async {
+    return login(identifier: email, password: password);
+  }
+
+  /// Register new student with name, loginOrEmail, password and confirmation
+  Future<AuthResult> register({
+    required String name,
+    required String loginOrEmail,
+    required String password,
+    String? confirmPassword,
+    DateTime? dob,
+  }) async {
+    if (confirmPassword != null && password != confirmPassword) {
+      return const AuthResult(
+        success: false,
+        errorMessage: 'Parollar bir xil emas.',
+      );
+    }
+
+    if (password.length < 8) {
+      return const AuthResult(
+        success: false,
+        errorMessage: 'Parol kamida 8 ta belgidan iborat bo‘lsin.',
+      );
+    }
+
+    final birthDate = dob ?? DateTime(2015, 5, 15);
+    final now = DateTime.now();
+    int age = now.year - birthDate.year;
+    if (now.month < birthDate.month || (now.month == birthDate.month && now.day < birthDate.day)) {
+      age--;
+    }
+
+    if (age >= 17) {
+      return const AuthResult(
+        success: false,
+        isAgeDenied: true,
+        errorMessage:
+            'MathCity AI faqat 16 yoshgacha bo‘lgan o‘quvchilar uchun mo‘ljallangan. Afsuski, siz kira olmaysiz.',
+      );
+    }
+
+    try {
+      final res = await ApiClient().dio.post('/auth/register', data: {
+        'displayName': name.trim(),
+        'loginOrEmail': loginOrEmail.trim(),
+        'password': password,
+        'confirmPassword': confirmPassword ?? password,
+        'dateOfBirth': birthDate.toIso8601String(),
+        'grade': (age - 5).clamp(1, 11),
+      });
+
+      if (res.data['success'] == true) {
+        final token = res.data['data']['token'] as String;
+        final bool isNewUser = res.data['data']['isNewUser'] == true;
+        final bool profileCompleted = res.data['data']['profileCompleted'] == true;
+        ApiClient().setAuthToken(token);
+        await StorageService.saveAuthToken(token);
+
+        final userData = res.data['data']['user'];
+        final student = StudentModel.fromJson(userData);
+        return AuthResult(
+          success: true,
+          student: student,
+          token: token,
+          isNewUser: isNewUser,
+          profileCompleted: profileCompleted,
+        );
+      } else {
+        return AuthResult(
+          success: false,
+          errorMessage: res.data['error'] ?? 'Ro‘yxatdan o‘tishda xatolik.',
+        );
+      }
+    } catch (e) {
+      if (e is DioException && e.response?.data != null && e.response?.data['error'] != null) {
+        return AuthResult(
+          success: false,
+          errorMessage: e.response!.data['error'].toString(),
+        );
+      }
+      return const AuthResult(
+        success: false,
+        errorMessage: 'Server bilan aloqa o‘rnatib bo‘lmadi. Qayta urinib ko‘ring.',
+      );
+    }
+  }
+
+  Future<AuthResult>? _ongoingRestore;
+
+  /// Check and restore existing session or attempt token refresh
+  Future<AuthResult> restoreSession({bool allowDemoFallback = false}) {
+    if (_ongoingRestore != null) {
+      return _ongoingRestore!;
+    }
+    _ongoingRestore = _doRestoreSession(allowDemoFallback: allowDemoFallback).whenComplete(() {
+      _ongoingRestore = null;
+    });
+    return _ongoingRestore!;
+  }
+
+  Future<AuthResult> _doRestoreSession({bool allowDemoFallback = false}) async {
+    try {
+      final savedToken = await StorageService.getAuthToken();
+      if (savedToken != null && savedToken.isNotEmpty) {
+        ApiClient().setAuthToken(savedToken);
+        try {
+          final res = await ApiClient().dio.get('/auth/me');
+          if (res.data['success'] == true) {
+            final student = StudentModel.fromJson(res.data['data']);
+            return AuthResult(success: true, student: student, token: savedToken);
+          }
+        } catch (_) {
+          // Token may be expired - attempt refresh
+          try {
+            final refreshRes = await ApiClient().dio.post('/auth/refresh');
+            if (refreshRes.data['success'] == true) {
+              final newToken = refreshRes.data['data']['token'] as String;
+              ApiClient().setAuthToken(newToken);
+              await StorageService.saveAuthToken(newToken);
+              final student = StudentModel.fromJson(refreshRes.data['data']['user']);
+              return AuthResult(success: true, student: student, token: newToken);
+            }
+          } catch (_) {
+            // Token refresh failed - invalid/expired session
+            await StorageService.clear();
+            ApiClient().setAuthToken(null);
+          }
+        }
+      }
+
+      if (allowDemoFallback) {
+        final demoRes = await ApiClient().dio.post('/auth/demo');
+        if (demoRes.data['success'] == true) {
+          final token = demoRes.data['data']['token'] as String;
+          ApiClient().setAuthToken(token);
+          await StorageService.saveAuthToken(token);
+          final student = StudentModel.fromJson(demoRes.data['data']['user']);
+          return AuthResult(success: true, student: student, token: token);
+        }
+      }
+    } catch (e) {
+      debugPrint('⚠️ Sessiyani tiklashda ogohlantirish: $e');
+    }
+
+    return const AuthResult(success: false);
+  }
+
+  /// Request password reset code
+  Future<Map<String, dynamic>> requestPasswordReset(String emailOrUsername) async {
+    try {
+      final res = await ApiClient().dio.post('/auth/forgot-password', data: {
+        'email': emailOrUsername.trim(),
+      });
+      return {
+        'success': res.data['success'] == true,
+        'message': res.data['message'] ?? 'Tiklash kodi yuborildi.',
+        'debugCode': res.data['debugCode'],
+      };
+    } catch (e) {
+      if (e is DioException && e.response?.data != null && e.response?.data['error'] != null) {
+        return {
+          'success': false,
+          'message': e.response!.data['error'].toString(),
+        };
+      }
+      return {
+        'success': false,
+        'message': 'Server bilan aloqa uzildi. Qayta urinib ko‘ring.',
+      };
+    }
+  }
+
+  /// Reset password with verified token
+  Future<Map<String, dynamic>> resetPassword({
+    required String emailOrUsername,
+    required String resetToken,
+    required String newPassword,
+  }) async {
+    try {
+      final res = await ApiClient().dio.post('/auth/reset-password', data: {
+        'email': emailOrUsername.trim(),
+        'resetToken': resetToken.trim(),
+        'newPassword': newPassword,
+      });
+      return {
+        'success': res.data['success'] == true,
+        'message': res.data['message'] ?? 'Parol yangilandi.',
+      };
+    } catch (e) {
+      if (e is DioException && e.response?.data != null && e.response?.data['error'] != null) {
+        return {
+          'success': false,
+          'message': e.response!.data['error'].toString(),
+        };
+      }
+      return {
+        'success': false,
+        'message': 'Parolni yangilashda xatolik yuz berdi.',
+      };
+    }
+  }
+
+  /// Sign In With Apple (Native iOS/macOS & Web flow)
+  Future<AuthResult> signInWithApple() async {
+    try {
+      // 1. Generate cryptographic raw nonce and sha256 hash
+      final rawNonce = base64Url.encode(
+        List<int>.generate(32, (_) => math.Random.secure().nextInt(256)),
+      );
+      final sha256Nonce = sha256.convert(utf8.encode(rawNonce)).toString();
+
+      // 2. Request credential from Apple ID
+      final credential = await SignInWithApple.getAppleIDCredential(
+        scopes: [
+          AppleIDAuthorizationScopes.email,
+          AppleIDAuthorizationScopes.fullName,
+        ],
+        nonce: sha256Nonce,
+        webAuthenticationOptions: WebAuthenticationOptions(
+          clientId: 'ai.mathcity.web',
+          redirectUri: Uri.parse('https://mathcity.ai/api/auth/apple/callback'),
+        ),
+      );
+
+      // 3. Post authoritative tokens to backend for server-side JWKS validation
+      final res = await ApiClient().dio.post('/auth/apple', data: {
+        'identityToken': credential.identityToken,
+        'authorizationCode': credential.authorizationCode,
+        'nonce': rawNonce,
+        'appleUserId': credential.userIdentifier,
+        'email': credential.email,
+        'fullName': credential.givenName != null || credential.familyName != null
+            ? {
+                'givenName': credential.givenName,
+                'familyName': credential.familyName,
+              }
+            : null,
+      });
+
+      if (res.data['success'] == true) {
+        final token = res.data['data']['token'] as String;
+        final bool isNewUser = res.data['data']['isNewUser'] == true;
+        final bool profileCompleted = res.data['data']['profileCompleted'] == true;
+        ApiClient().setAuthToken(token);
+        await StorageService.saveAuthToken(token);
+
+        final userData = res.data['data']['user'];
+        final student = StudentModel.fromJson(userData);
+        return AuthResult(
+          success: true,
+          student: student,
+          token: token,
+          isNewUser: isNewUser,
+          profileCompleted: profileCompleted,
+        );
+      } else {
+        return AuthResult(
+          success: false,
+          errorMessage: res.data['error'] ?? 'Apple orqali kirishda xatolik yuz berdi.',
+        );
+      }
+    } on SignInWithAppleAuthorizationException catch (e) {
+      if (e.code == AuthorizationErrorCode.canceled) {
+        return const AuthResult(success: false, errorMessage: null);
+      }
+      return AuthResult(
+        success: false,
+        errorMessage: 'Apple tizimiga kirish bekor qilindi yoki xato yuz berdi (${e.message}).',
+      );
+    } catch (e) {
+      debugPrint('ℹ️ Apple sign in error: $e');
+      final err = e.toString().toLowerCase();
+      if (err.contains('cancel') || err.contains('closed') || err.contains('dismissed')) {
+        return const AuthResult(success: false, errorMessage: null);
+      }
+      if (err.contains('notsupported') || err.contains('not supported')) {
+        return const AuthResult(
+          success: false,
+          errorMessage:
+              'Ushbu qurilmada Apple orqali kirish qo‘llab-quvvatlanmaydi. Login va parol yoki Google orqali kiring.',
+        );
+      }
+      return const AuthResult(
+        success: false,
+        errorMessage: 'Apple orqali ulanishda xatolik yuz berdi. Internet aloqasini tekshiring.',
+      );
+    }
+  }
+
+  /// Check username availability and uniqueness
+  Future<Map<String, dynamic>> checkUsername(String username) async {
+    try {
+      final res = await ApiClient().dio.get('/auth/username-available', queryParameters: {
+        'username': username.trim(),
+      });
+      if (res.data['success'] == true) {
+        return res.data['data'] as Map<String, dynamic>;
+      }
+      return {'available': false, 'message': res.data['error'] ?? 'Xatolik'};
+    } catch (e) {
+      if (e is DioException && e.response?.data != null && e.response?.data['error'] != null) {
+        return {'available': false, 'message': e.response!.data['error'].toString()};
+      }
+      return {'available': false, 'message': 'Foydalanuvchi nomini tekshirishda xatolik yuz berdi.'};
+    }
+  }
+
+  /// Complete student profile with unique username and verified birth date
+  Future<AuthResult> completeProfile({
+    required String username,
+    required int day,
+    required int month,
+    required int year,
+  }) async {
+    try {
+      final res = await ApiClient().dio.post('/auth/complete-profile', data: {
+        'username': username.trim(),
+        'birthDay': day,
+        'birthMonth': month,
+        'birthYear': year,
+      });
+
+      if (res.data['success'] == true) {
+        final userData = res.data['data']['user'];
+        final student = StudentModel.fromJson(userData);
+        final bool requiresParentalConsent = res.data['data']['requiresParentalConsent'] == true;
+        return AuthResult(
+          success: true,
+          student: student,
+          profileCompleted: true,
+          requiresParentalConsent: requiresParentalConsent,
+        );
+      } else {
+        return AuthResult(
+          success: false,
+          errorMessage: res.data['error'] ?? 'Profilni saqlashda xatolik.',
+        );
+      }
+    } catch (e) {
+      if (e is DioException && e.response?.data != null && e.response?.data['error'] != null) {
+        return AuthResult(
+          success: false,
+          errorMessage: e.response!.data['error'].toString(),
+        );
+      }
+      return const AuthResult(
+        success: false,
+        errorMessage: 'Profilni saqlashda server bilan aloqa uzildi.',
+      );
+    }
+  }
+
+  /// Backwards-compatibility wrapper for completeOnboarding
+  Future<AuthResult> completeOnboarding({
+    required String username,
+    required int day,
+    required int month,
+    required int year,
+  }) async {
+    return completeProfile(username: username, day: day, month: month, year: year);
+  }
+
+  /// In-App Account Deletion (App Store Guideline compliance)
+  Future<bool> deleteAccount() async {
+    try {
+      final res = await ApiClient().dio.delete('/auth/account');
+      if (res.data['success'] == true) {
+        await signOut();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('⚠️ Hisobni o‘chirishda xatolik: $e');
+      return false;
+    }
+  }
+
+  /// Sign Out
+  Future<void> signOut() async {
+    ApiClient().setAuthToken(null);
+    await StorageService.clear();
+    final googleSignIn = _getGoogleSignIn();
+    if (googleSignIn != null) {
+      try {
+        await googleSignIn.signOut();
+      } catch (_) {}
+    }
+  }
+}
