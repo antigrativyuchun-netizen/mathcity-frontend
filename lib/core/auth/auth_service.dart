@@ -43,7 +43,7 @@ class AuthService {
   /// Web OAuth Client ID from Google Cloud Console
   /// Authorized JavaScript origins: http://localhost:8085
 
-    
+
   
   static String webClientId = const String.fromEnvironment(
     'GOOGLE_CLIENT_ID',
@@ -68,6 +68,8 @@ class AuthService {
     iosClientId = clientId;
   }
 
+  
+
   /// Controlled lazy initialization for GoogleSignIn
   GoogleSignIn? _getGoogleSignIn() {
     if (_googleSignInInitFailed) return null;
@@ -77,7 +79,7 @@ class AuthService {
       _googleSignInInstance = GoogleSignIn(
         clientId: kIsWeb ? webClientId : iosClientId,
         serverClientId: kIsWeb ? null : webClientId,
-        scopes: const ['email', 'profile'],
+        scopes: kIsWeb ? const [] : const ['email', 'profile'],
       );
       return _googleSignInInstance;
     } catch (e, stack) {
@@ -311,13 +313,26 @@ class AuthService {
     }
 
     try {
-      final res = await ApiClient().dio.post('/auth/register', data: {
-        'displayName': name.trim(),
-        'loginOrEmail': loginOrEmail.trim(),
-        'password': password,
-        'confirmPassword': confirmPassword ?? password,
-        'dateOfBirth': birthDate.toIso8601String(),
-        'grade': (age - 5).clamp(1, 11),
+      final res = await ApiClient().dio.post(
+        '/auth/register',
+        data: {
+          'displayName': name.trim(),
+          'loginOrEmail': loginOrEmail.trim(),
+          'password': password,
+          'confirmPassword': confirmPassword ?? password,
+          'dateOfBirth': birthDate.toIso8601String(),
+          'grade': (age - 5).clamp(1, 11),
+        },
+        options: Options(
+          sendTimeout: const Duration(seconds: 10),
+          receiveTimeout: const Duration(seconds: 20),
+        ),
+      ).timeout(const Duration(seconds: 15), onTimeout: () {
+        throw DioException(
+          requestOptions: RequestOptions(path: '/auth/register'),
+          type: DioExceptionType.receiveTimeout,
+          error: 'Server javob berish vaqti tugadi (15 soniya).',
+        );
       });
 
       if (res.data['success'] == true) {
@@ -354,6 +369,16 @@ class AuthService {
         errorMessage: 'Server bilan aloqa o‘rnatib bo‘lmadi. Qayta urinib ko‘ring.',
       );
     }
+  }
+
+  /// Non-blocking background warm-up ping to /health (wakes sleeping Render server)
+  static void warmUpBackend() {
+    try {
+      ApiClient().dio.get('/health', options: Options(
+        sendTimeout: const Duration(seconds: 3),
+        receiveTimeout: const Duration(seconds: 3),
+      )).ignore();
+    } catch (_) {}
   }
 
   Future<AuthResult>? _ongoingRestore;
@@ -394,7 +419,7 @@ class AuthService {
           } catch (_) {
             // Token refresh failed - invalid/expired session
             await StorageService.clear();
-            ApiClient().setAuthToken(null);
+            ApiClient().clearAuthToken();
           }
         }
       }
@@ -648,7 +673,7 @@ class AuthService {
 
   /// Sign Out
   Future<void> signOut() async {
-    ApiClient().setAuthToken(null);
+    ApiClient().clearAuthToken();
     await StorageService.clear();
     final googleSignIn = _getGoogleSignIn();
     if (googleSignIn != null) {

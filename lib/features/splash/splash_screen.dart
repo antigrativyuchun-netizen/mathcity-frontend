@@ -35,6 +35,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
     );
 
     _controller.forward();
+    AuthService.warmUpBackend();
     _checkAuthAndNavigate();
   }
 
