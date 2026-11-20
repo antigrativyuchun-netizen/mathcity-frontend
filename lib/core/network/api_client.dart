@@ -23,7 +23,7 @@ class ApiClient {
         },
       ),
     );
-    
+  
     dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (options, handler) async {
